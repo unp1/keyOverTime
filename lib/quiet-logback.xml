@@ -1,0 +1,12 @@
+<configuration>
+  <!-- Benchmark logging: keep stdout clean (only the BENCH/SETTINGS lines the harness parses) by
+       sending anything WARN or above to stderr and dropping the DEBUG/INFO load-phase flood that
+       otherwise dominates the output files and adds console I/O to the measured runs. -->
+  <appender name="E" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder><pattern>%-5level %logger{0} - %msg%n</pattern></encoder>
+  </appender>
+  <root level="WARN">
+    <appender-ref ref="E"/>
+  </root>
+</configuration>

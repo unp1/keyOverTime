@@ -1,0 +1,5 @@
+# The report generators. Installed automatically into .venv on the first run.
+# Both are permissively licensed (matplotlib: BSD-style; openpyxl: MIT), as are their
+# transitive dependencies, so nothing here constrains this project's own licence.
+matplotlib>=3.8
+openpyxl>=3.1

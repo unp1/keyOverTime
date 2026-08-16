@@ -1,0 +1,23 @@
+# The versions to compare, oldest first. This is the only place a version is declared:
+# keyovertime creates one detached checkout per row, builds it and measures it. To add a
+# version, add a row. The row order here is the column order in every chart and table.
+#
+# name         directory name under <workdir>/checkouts, and the id used in the results
+# commit       anything git resolves in the KeY clone: a sha, a tag, or a remote branch
+# display      label on chart axes and table headers; keep it short, it has to fit a column
+# description  one line, shown in the version table at the top of the report
+#
+# workers      blank for the run's default (--workers). A row that names a count is measured in
+#              the parallel phase only, at that count. Two rows on the same commit, one blank and
+#              one naming a count, is how a version appears at two worker counts; they share one
+#              checkout, so the second costs no build.
+#
+# Fields containing a comma must be quoted, as one description below is.
+name,commit,display,description,workers
+t1-2.12.4,46d923c792,2.12.4,KeY 2.12.4 release candidate branch (the last version before the JavaParser migration),
+t2-april,fed02b1ab8,JP-2026-04,"Main on 2026-04-09, about two weeks after the Recoder removal (#3120, 2026-03-28).",
+t3-3.0,89522a5a40,KeY-3.0,KeY 3.0 release candidate,
+t4-mt,e127150e05,3.1-dev-MT,Main at the multithreading merge (#3842),
+t5-main,e92bde2180,3.1-dev-main,Main after last perf series,
+t6-main,origin/main,KeY-main,"Current tip of main. A branch rather than a sha, so it resolves in any clone; it moves.",
+t6-main-8w,origin/main,KeY-main,The same commit at eight workers,8
