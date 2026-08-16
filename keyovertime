@@ -1,0 +1,361 @@
+#!/bin/zsh
+# KeY over time: compare the performance of several KeY versions on one corpus, in one command.
+#
+#   keyovertime --key-repo <path-to-key-clone> --workdir <dir>
+#
+# That is the whole required input. Everything else is found or derived: the JDK, the Python
+# environment, the per-version checkouts, the build, the measurement and the report.
+#
+#   --key-repo <path>    a clone of the KeY repository. Checkouts are created from it with
+#                        `git worktree`, so it is only ever read.
+#   --workdir <dir>      where everything generated goes: <dir>/checkouts (one per version),
+#                        <dir>/out (results, logs, report), <dir>/checkouts.csv.
+#   --versions <file>    which versions to compare (default config/versions.csv)
+#   --corpus <file>      which proofs to run (default config/corpus.csv)
+#   --corpus-dir <dir>   the directory relative paths in the corpus resolve against. Without it
+#                        they resolve against the examples tree of the version being measured,
+#                        which is what the shipped corpus of KeY's own examples wants. A file is
+#                        looked for under <dir>/<version name>/ first and then under <dir>/, so a
+#                        version that needs its own variant of a proof gets one by placing it
+#                        there, without a second copy of the whole corpus.
+#
+# Both inputs can also come from the environment, as KEY_REPO and KEYOVERTIME_WORKDIR.
+#
+# Every step is idempotent: a rerun after an interruption reuses the checkouts that are already
+# there and Gradle skips a build whose inputs did not change, so it picks up where it left off.
+#
+# Options:
+#   --smoke              one rep per proof into a separate output directory, to see what runs
+#                        before committing the hours
+#   --skip-build         do not create checkouts or build; measure with what is already built
+#   --build-only         stop after the checkouts and builds
+#   --report-only        skip measuring; aggregate and render what is already in the output dir
+#   --load-only          measure loading only: automode is capped at one rule, only the sc phase
+#                        runs, and the report carries just the two loading metrics. Sound because
+#                        javaMs and loadMs are both taken during the load, before the step budget
+#                        matters; everything downstream of it is meaningless and so is not reported.
+#   --only <sc|mt>       run one measurement phase instead of both
+#   --reps <n>           reps per JVM (default 3; rep 1 warms the JIT, later reps are the measurement)
+#   --workers <n>        parallel prover threads for the mt phase (default 4)
+#   --title <text>       title for the report and the PDF cover
+#   --no-java-timer      leave every checkout unpatched; javaMs is then not collected
+#   --java-home <path>   JDK to build and run with, instead of the detected one
+#   --outdir <dir>       results and report elsewhere than <workdir>/out
+#   --jobs <n>           Gradle workers during the build (default: let Gradle decide)
+#   -n, --dry-run        print what would run, touch nothing
+#   -h, --help           this text
+set -eu
+HERE=${0:A:h}
+
+# ------------------------------------------------------------------ defaults and options
+KEY_REPO=${KEY_REPO:-}
+WORKDIR=${KEYOVERTIME_WORKDIR:-}
+VERSIONS=$HERE/config/versions.csv
+CORPUS=$HERE/config/corpus.csv
+CORPUS_DIR=${KEYOVERTIME_CORPUS_DIR:-}
+JAVA_HOME_OPT=${BENCH_JAVA_HOME:-}
+OUTDIR=""
+REPS=3
+WORKERS=4
+JOBS=""
+PHASES=(sc mt)
+SKIP_BUILD=0 REPORT_ONLY=0 BUILD_ONLY=0 LOAD_ONLY=0 SMOKE=0 DRYRUN=0
+TITLE="KeY performance over time"
+JAVA_TIMER_BUILD=on
+
+die() { print -ru2 -- "keyovertime: $*"; exit 1 }
+note() { print -r -- "$*" }
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --key-repo)      KEY_REPO=${2:A}; shift 2 ;;
+        --workdir)       WORKDIR=${2:A}; shift 2 ;;
+        --versions)      VERSIONS=${2:A}; shift 2 ;;
+        --corpus)        CORPUS=${2:A}; shift 2 ;;
+        --corpus-dir)    CORPUS_DIR=${2:A}; shift 2 ;;
+        --java-home)     JAVA_HOME_OPT=${2:A}; shift 2 ;;
+        --outdir)        OUTDIR=${2:A}; shift 2 ;;
+        --title)         TITLE=$2; shift 2 ;;
+        --only)          PHASES=(${=2}); shift 2 ;;
+        --reps)          REPS=$2; shift 2 ;;
+        --workers)       WORKERS=$2; shift 2 ;;
+        --jobs)          JOBS=$2; shift 2 ;;
+        --smoke)         SMOKE=1; REPS=1; shift ;;
+        --skip-build)    SKIP_BUILD=1; shift ;;
+        --report-only)   REPORT_ONLY=1; SKIP_BUILD=1; shift ;;
+        --build-only)    BUILD_ONLY=1; shift ;;
+        --load-only)     LOAD_ONLY=1; shift ;;
+        --no-java-timer) JAVA_TIMER_BUILD=off; shift ;;
+        -n|--dry-run)    DRYRUN=1; shift ;;
+        -h|--help)       sed -n '2,60p' $0 | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)               die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# ------------------------------------------------------------------ the two required inputs
+[[ -n $KEY_REPO ]] || die "no KeY clone given. Use --key-repo <path>, or set KEY_REPO.
+       It is a clone of https://github.com/KeYProject/key and is only read from."
+[[ -n $WORKDIR ]] || die "no working directory given. Use --workdir <dir>, or set KEYOVERTIME_WORKDIR.
+       Checkouts, results and the report are written there; nothing is written next to this script."
+
+git -C $KEY_REPO rev-parse --git-dir >/dev/null 2>&1 \
+    || die "$KEY_REPO is not a git repository"
+[[ -d $KEY_REPO/key.core ]] \
+    || die "$KEY_REPO has no key.core directory, so it does not look like a KeY clone"
+[[ -f $VERSIONS ]] || die "versions file not found: $VERSIONS"
+[[ -f $CORPUS   ]] || die "corpus file not found: $CORPUS"
+[[ -z $CORPUS_DIR || -d $CORPUS_DIR ]] || die "corpus directory not found: $CORPUS_DIR"
+
+CHECKOUTS=$WORKDIR/checkouts
+: ${OUTDIR:=$WORKDIR/out}
+[[ $SMOKE -eq 1 && $OUTDIR == $WORKDIR/out ]] && OUTDIR=$WORKDIR/out-smoke
+REGISTRY=$WORKDIR/checkouts.csv
+
+# ------------------------------------------------------------------ the Python environment
+# Created on first use rather than documented as a prerequisite: the report generators need
+# matplotlib and openpyxl, and a run that measures for hours and then cannot draw its report has
+# wasted the hours.
+PY=$HERE/.venv/bin/python
+ensure_python() {
+    if [[ ! -x $PY ]]; then
+        note "== creating the Python environment in $HERE/.venv"
+        [[ $DRYRUN -eq 1 ]] && { PY=python3; return }
+        python3 -m venv $HERE/.venv || die "cannot create a virtualenv with python3 -m venv"
+    fi
+    if ! $PY -c "import matplotlib, openpyxl" >/dev/null 2>&1; then
+        note "== installing the report dependencies"
+        [[ $DRYRUN -eq 1 ]] && return
+        $PY -m pip install --quiet --upgrade pip
+        $PY -m pip install --quiet -r $HERE/requirements.txt \
+            || die "cannot install the dependencies listed in requirements.txt"
+    fi
+}
+
+# ------------------------------------------------------------------ the JDK
+# One JDK builds and runs every version, and it has to be native. A build/run split across two
+# major versions, or an x86 JDK under Rosetta, puts a difference into every timing that has nothing
+# to do with KeY: Rosetta roughly doubles the times while leaving node counts untouched, which is
+# exactly the kind of difference that reads as a real result.
+detect_java() {
+    local candidates=() c
+    [[ -n $JAVA_HOME_OPT ]] && candidates+=$JAVA_HOME_OPT
+    [[ -n ${JAVA_HOME:-} ]] && candidates+=$JAVA_HOME
+    if [[ -x /usr/libexec/java_home ]]; then
+        for v in 21 22 23 24 25; do
+            c=$(/usr/libexec/java_home -v $v 2>/dev/null) && [[ -n $c ]] && candidates+=$c
+        done
+    fi
+    c=$(command -v javac 2>/dev/null) && [[ -n $c ]] && candidates+=${c:A:h:h}
+
+    for c in $candidates; do
+        [[ -x $c/bin/java && -x $c/bin/javac ]] || continue
+        local ver=$($c/bin/java -XshowSettings:properties -version 2>&1 \
+                    | awk -F'= *' '/java.specification.version/{print $2}')
+        (( ${ver%%.*} >= 21 )) || continue
+        local arch=$($c/bin/java -XshowSettings:properties -version 2>&1 \
+                     | awk -F'= *' '/os.arch/{print $2}')
+        local machine=$(uname -m)
+        if [[ $machine == arm64 && $arch == x86_64 ]]; then
+            note "  skipping $c: an x86_64 JDK on an arm64 machine runs under Rosetta and would"
+            note "  roughly double every timing"
+            continue
+        fi
+        JDK=$c JDK_VER=$ver JDK_ARCH=$arch
+        return 0
+    done
+    die "no JDK 21 or newer found. Use --java-home <path>, or set BENCH_JAVA_HOME.
+       A single native JDK has to build and run every version, or the timings are not comparable."
+}
+
+# ------------------------------------------------------------------ resolve every version first
+# Before anything is created or built. Building one version takes minutes, so finding out at the
+# sixth row that its commit is not in the clone wastes every build before it. All the bad rows are
+# reported at once, rather than one per run.
+typeset -A RESOLVED
+typeset -a UNRESOLVED
+if [[ $SKIP_BUILD -eq 0 ]]; then
+    while IFS=$'\t' read -r name commit display desc; do
+        sha=$(git -C $KEY_REPO rev-parse --verify -q "${commit}^{commit}" 2>/dev/null) \
+            && RESOLVED[$name]=$sha || UNRESOLVED+="$name names $commit"
+    done < <($HERE/python/csvio.py rows $VERSIONS --min-fields 2 --pad 4)
+    if (( ${#UNRESOLVED} )); then
+        print -ru2 -- "keyovertime: $VERSIONS names commits that are not in $KEY_REPO:"
+        for u in $UNRESOLVED; do print -ru2 -- "         $u"; done
+        print -ru2 -- ""
+        print -ru2 -- "       Fetch, in case the clone is behind:"
+        print -ru2 -- "           git -C $KEY_REPO fetch --all"
+        print -ru2 -- "       A commit that is still missing after that is not upstream. Correct the"
+        print -ru2 -- "       row, or use a branch such as origin/main, which resolves in any clone."
+        exit 1
+    fi
+fi
+
+# Every proof, for every version measured on it, before anything is built. Without a corpus
+# directory only the absolute paths can be checked, since the relative ones live in examples trees
+# that do not exist until the checkouts do; an absolute path costs nothing to check and is the one
+# most easily mistyped.
+if [[ $REPORT_ONLY -eq 0 ]]; then
+    typeset -a VNAMES
+    VNAMES=(${(f)"$($HERE/python/csvio.py rows $VERSIONS --min-fields 2 --pad 5 | cut -f1)"})
+    $HERE/python/corpus_check.py $CORPUS "$CORPUS_DIR" $VNAMES \
+        || die "the corpus above cannot be measured as it stands"
+fi
+
+# ------------------------------------------------------------------ report what will happen
+detect_java
+note "KeY clone   $KEY_REPO"
+note "workdir     $WORKDIR"
+note "  checkouts $CHECKOUTS"
+note "  results   $OUTDIR"
+note "versions    $VERSIONS"
+note "corpus      $CORPUS"
+if [[ -n $CORPUS_DIR ]]; then
+    note "  proofs in $CORPUS_DIR"
+else
+    note "  proofs in each version's own examples tree (no --corpus-dir given)"
+fi
+note "JDK         $JDK (Java $JDK_VER, $JDK_ARCH)"
+note "run         reps=$REPS phases=${PHASES} workers=$WORKERS java-timer=$JAVA_TIMER_BUILD"
+[[ $LOAD_ONLY -eq 1 ]] && note "mode        load-only (parsing and loading only)"
+if [[ $DRYRUN -eq 1 ]]; then
+    note ""
+    note "dry run: versions that would be measured"
+    $HERE/python/csvio.py rows $VERSIONS --pad 4 | while IFS=$'\t' read -r n c d rest; do
+        note "  $n  $c -> ${RESOLVED[$n]:-<not resolved>}  ${d:-$n}"
+    done
+    note "proofs that would be measured"
+    $HERE/python/csvio.py rows $CORPUS --pad 6 | while IFS=$'\t' read -r g l p rest; do
+        note "  $g/$l  $p"
+    done
+    exit 0
+fi
+
+mkdir -p $WORKDIR $OUTDIR
+ensure_python
+
+export BENCH_VERSIONS=$VERSIONS
+export BENCH_CONFIGS=$REGISTRY
+if [[ $LOAD_ONLY -eq 1 ]]; then
+    PHASES=(sc)
+    export BENCH_METRICS=javaMs,loadMs
+    export BENCH_LOAD_ONLY=1
+fi
+
+# ------------------------------------------------------------------ checkouts and builds
+if [[ $SKIP_BUILD -eq 0 ]]; then
+    mkdir -p $CHECKOUTS
+    # git registers every worktree inside the clone, and the registration outlives the directory:
+    # delete a working directory by hand, or lose one when a run is interrupted, and `worktree add`
+    # then refuses to recreate it. Pruning drops exactly the registrations whose directory is gone
+    # and leaves every live one alone, so it is safe to do on each run rather than to explain in an
+    # error message.
+    git -C $KEY_REPO worktree prune
+    # Rows that name the same commit share one checkout. Two rows on one commit is how a version is
+    # measured at more than one worker count, and building KeY twice for it would be the bulk of the
+    # run's time spent producing the same bytes.
+    typeset -A CHECKOUT_FOR
+    while IFS=$'\t' read -r name commit display desc workers; do
+        want=${RESOLVED[$name]}
+        if [[ -n ${CHECKOUT_FOR[$want]:-} ]]; then
+            WT=${CHECKOUT_FOR[$want]}
+            note "== $name: same commit as an earlier row, sharing $WT"
+        elif [[ ! -d $CHECKOUTS/$name ]]; then
+            WT=$CHECKOUTS/$name
+            CHECKOUT_FOR[$want]=$WT
+            note "== $name: checking out ${want[1,10]}"
+            git -C $KEY_REPO worktree add --detach $WT $want >/dev/null
+        else
+            # An existing checkout is only reusable if it is at the commit this row now names.
+            # Reusing it blindly would measure whatever was checked out last and label it with the
+            # new sha, which is a wrong result that looks entirely plausible.
+            WT=$CHECKOUTS/$name
+            CHECKOUT_FOR[$want]=$WT
+            have=$(git -C $WT rev-parse --verify HEAD 2>/dev/null) \
+                || die "$name: $WT exists but is not a git worktree. Remove it and rerun."
+            if [[ $want == $have ]]; then
+                note "== $name: at ${have[1,10]}, reusing"
+            else
+                note "== $name: at ${have[1,10]}, row wants ${want[1,10]}; switching"
+                # The harness itself dirties the checkout: it patches ProblemInitializer.java and
+                # drops in BenchMain.java. Those are reproduced on every run, so discarding them is
+                # safe. Anything else is someone's work, and this script will not throw it away.
+                unexpected=$(git -C $WT status --porcelain --untracked-files=no \
+                    | grep -v 'proof/init/ProblemInitializer.java$' || true)
+                [[ -z $unexpected ]] || die "$name: $WT has uncommitted changes beyond the
+       benchmark patch:
+$unexpected
+       Resolve them, or remove the checkout to have it recreated:
+       git -C $KEY_REPO worktree remove --force $WT"
+                git -C $WT checkout --detach --force $want >/dev/null
+            fi
+        fi
+        # Called for a shared checkout too. Everything it does is idempotent, so the second call is
+        # a no-op build that registers the row, which is exactly what a second worker count needs.
+        BENCH_JAVA_HOME=$JDK BENCH_JAVA_TIMER=$JAVA_TIMER_BUILD BENCH_CONFIGS=$REGISTRY \
+            BENCH_GRADLE_JOBS=$JOBS KEYOVERTIME_HOME=$HERE \
+            zsh $HERE/lib/build_config.sh $name $WT "$workers"
+    done < <($HERE/python/csvio.py rows $VERSIONS --min-fields 2 --pad 5)
+fi
+
+if [[ $BUILD_ONLY -eq 1 ]]; then
+    note "build-only: checkouts and builds are up to date; nothing measured"
+    exit 0
+fi
+[[ -s $REGISTRY ]] || die "$REGISTRY is empty; run once without --skip-build"
+
+# The load-only corpus is derived from the real one rather than kept as a second file, so it can
+# never drift from it: same proofs, same settings, but a one-rule budget and no version pins. Those
+# pins exist where a proof cannot close on an older prover, which is a fact about proof search;
+# loading works everywhere, so a loading comparison wants every version on every proof.
+CORPUS_FILE=$CORPUS
+if [[ $LOAD_ONLY -eq 1 ]]; then
+    CORPUS_FILE=$OUTDIR/corpus-load.csv
+    $PY $HERE/python/corpus_load.py $CORPUS $CORPUS_FILE
+    note "load-only: derived $CORPUS_FILE (maxSteps=1, no version pins)"
+fi
+
+# ------------------------------------------------------------------ measurement
+# The phases run one after another, never at the same time: an sc run and an mt run competing for
+# the same cores would make both sets of timings meaningless.
+if [[ $REPORT_ONLY -eq 0 ]]; then
+    for phase in $PHASES; do
+        note "== measuring: $phase"
+        REPS=$REPS WORKERS=$WORKERS OUTDIR=$OUTDIR BENCH_JAVA_HOME=$JDK \
+            CONFIGS=$REGISTRY CORPUS=$CORPUS_FILE CORPUS_DIR=$CORPUS_DIR KEYOVERTIME_HOME=$HERE \
+            zsh $HERE/lib/run_bench.sh $phase $phase
+    done
+fi
+
+# ------------------------------------------------------------------ aggregation and report
+typeset -a RESULTS
+for f in $OUTDIR/results_*.csv; do
+    [[ -f $f ]] && RESULTS+=$f
+done
+(( ${#RESULTS} )) || die "no results_*.csv in $OUTDIR"
+
+# The generators label the parallel columns and state the method from this, so it has to be the
+# value the mt phase actually ran at rather than their own default.
+export BENCH_WORKERS=$WORKERS
+
+$PY $HERE/python/aggregate.py $RESULTS -o $OUTDIR/tidy.csv
+for phase in sc mt; do
+    [[ -f $OUTDIR/results_$phase.csv ]] || continue
+    $PY $HERE/python/settings_diff.py $OUTDIR $phase > $OUTDIR/settings_$phase.txt || true
+done
+# The settings diff stays a file of its own rather than a section of the report: it is the check
+# that establishes the comparison is fair, which matters when reading the results but does not
+# belong in the figures.
+
+# Three artefacts, each doing one job: the page for exploring with hover, the PDF for figures that
+# go into a document, the workbook for the numbers. Charts live only in the PDF, because a native
+# spreadsheet chart is re-rendered by whatever opens it and the log axes, end labels and exact
+# series colours do not survive that.
+$PY $HERE/python/gen_report.py $OUTDIR/tidy.csv -o $OUTDIR/report.html --title $TITLE
+$PY $HERE/python/gen_pdf.py    $OUTDIR/tidy.csv -o $OUTDIR/report.pdf  --title $TITLE
+$PY $HERE/python/gen_xlsx.py   $OUTDIR/tidy.csv -o $OUTDIR/keyOverTime.xlsx --corpus $CORPUS_FILE
+
+note ""
+note "tidy data: $OUTDIR/tidy.csv"
+note "report:    $OUTDIR/report.html"
+note "figures:   $OUTDIR/report.pdf"
+note "workbook:  $OUTDIR/keyOverTime.xlsx"

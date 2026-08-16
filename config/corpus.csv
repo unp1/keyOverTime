@@ -1,0 +1,17 @@
+# The proof corpus. The shipped set is chosen from the examples KeY itself ships, so it works
+# against any KeY clone without further downloads.
+#
+# group         free grouping label, used to section the report
+# label         short name of the proof; it identifies the proof in every table and chart
+# path          relative to the examples tree of the version being measured, or absolute for a
+#               proof that lives outside the KeY repository
+# maxSteps      cap on automatic rule applications; 0 means no cap
+# fileSettings  1 to prove on the settings stored in the file itself, 0 for the version defaults
+# onlyVersions  blank for every version, or the names from versions.csv this proof applies to,
+#               separated by spaces. Use it where a proof cannot close on the older versions.
+group,label,path,maxSteps,fileSettings,onlyVersions
+examples,SLL_remove,heap/list_seq/SimplifiedLinkedList.remove.key,300000,0,
+examples,symmArray,standard_key/java_dl/symmArray.key,300000,0,
+examples,Saddleback,heap/saddleback_search/Saddleback_search.key,300000,0,
+examples,jml_infoflow,standard_key/java_dl/jml-information-flow.key,300000,0,
+examples,gemplus_add,standard_key/arith/gemplusDecimal/add.key,300000,0,
